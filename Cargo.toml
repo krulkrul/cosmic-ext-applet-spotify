@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 libcosmic = { package = "libcosmic", git = "https://github.com/pop-os/libcosmic", rev = "c52ef976500c270b1f9b5fe488dbe5e153022ad3", features = [
     "applet",
+    "applet-token",
     "wayland",
     "winit",
     "tokio",

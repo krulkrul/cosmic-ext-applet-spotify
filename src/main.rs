@@ -1,8 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #![allow(hidden_glob_reexports)]
 
+mod toplevel;
+
 use libcosmic as cosmic;
 use cosmic::app::{Core, Task};
+use cosmic::applet::token::subscription::{
+    TokenRequest, TokenUpdate, activation_token_subscription,
+};
+use cosmic::cctk::sctk::reexports::calloop;
+use toplevel::{TopCmd, TopUpdate};
 use cosmic::iced::window::Id;
 use cosmic::iced::{Alignment, ContentFit, Length, Subscription};
 use cosmic::surface::action::{app_popup, destroy_popup};
@@ -21,6 +28,8 @@ const MPRIS_BUS: &str = "org.mpris.MediaPlayer2.spotify";
 const MPRIS_PATH: &str = "/org/mpris/MediaPlayer2";
 const MPRIS_PLAYER: &str = "org.mpris.MediaPlayer2.Player";
 const SPOTIFY_FLATPAK: &str = "com.spotify.Client";
+/// App ID reported by Spotify over the Wayland toplevel protocol
+const SPOTIFY_TOPLEVEL_ID: &str = "spotify";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -274,7 +283,9 @@ pub enum Message {
     PlayPause,
     Next,
     Previous,
-    LaunchSpotify,
+    RaiseSpotify,
+    Token(TokenUpdate),
+    Toplevel(TopUpdate),
     ToggleSettings,
     // Config mutations
     SetPanelDisplay(String),
@@ -299,6 +310,12 @@ pub struct AppModel {
     album_art_path: Option<PathBuf>,
     /// Track id for which art was last fetched (avoids re-fetching same art)
     art_track_id: String,
+    /// Sender for requesting XDG activation tokens from the compositor
+    token_tx: Option<calloop::channel::Sender<TokenRequest>>,
+    /// Sender for toplevel management commands (minimize)
+    toplevel_tx: Option<calloop::channel::Sender<TopCmd>>,
+    /// Whether the Spotify window is currently the active/focused toplevel
+    spotify_activated: bool,
 }
 
 // ─── Application impl ─────────────────────────────────────────────────────────
@@ -324,6 +341,9 @@ impl cosmic::Application for AppModel {
                 show_settings: false,
                 album_art_path: None,
                 art_track_id: String::new(),
+                token_tx: None,
+                toplevel_tx: None,
+                spotify_activated: false,
             },
             task,
         )
@@ -412,11 +432,53 @@ impl cosmic::Application for AppModel {
                 });
             }
 
-            Message::LaunchSpotify => {
-                let _ = std::process::Command::new("flatpak")
-                    .args(["run", SPOTIFY_FLATPAK])
-                    .spawn();
+            Message::RaiseSpotify => {
+                if self.spotify_activated {
+                    // Already in focus — minimize
+                    if let Some(tx) = &self.toplevel_tx {
+                        let _ = tx.send(TopCmd::Minimize(SPOTIFY_TOPLEVEL_ID.to_string()));
+                    }
+                } else {
+                    // Not in focus — raise with activation token
+                    if let Some(tx) = &self.token_tx {
+                        let req = TokenRequest {
+                            app_id: SPOTIFY_FLATPAK.to_string(),
+                            exec: format!("flatpak run {SPOTIFY_FLATPAK}"),
+                        };
+                        let _ = tx.send(req);
+                    } else {
+                        let _ = std::process::Command::new("flatpak")
+                            .args(["run", SPOTIFY_FLATPAK])
+                            .spawn();
+                    }
+                }
             }
+
+            Message::Toplevel(update) => match update {
+                TopUpdate::Init(tx) => {
+                    self.toplevel_tx = Some(tx);
+                }
+                TopUpdate::AppActivated { active, .. } => {
+                    self.spotify_activated = active;
+                }
+            },
+
+            Message::Token(update) => match update {
+                TokenUpdate::Init(tx) => {
+                    self.token_tx = Some(tx);
+                }
+                TokenUpdate::ActivationToken { token, exec } => {
+                    let mut cmd = std::process::Command::new("sh");
+                    cmd.args(["-c", &exec]);
+                    if let Some(t) = token {
+                        cmd.env("XDG_ACTIVATION_TOKEN", t);
+                    }
+                    let _ = cmd.spawn();
+                }
+                TokenUpdate::Finished => {
+                    self.token_tx = None;
+                }
+            },
 
             Message::ToggleSettings => {
                 self.show_settings = !self.show_settings;
@@ -481,11 +543,11 @@ impl cosmic::Application for AppModel {
                 let btn = cosmic::widget::button::custom(icon)
                     .padding([v_pad, 8])
                     .class(cosmic::theme::Button::AppletIcon)
-                    .on_press(Message::LaunchSpotify);
+                    .on_press(Message::RaiseSpotify);
                 self.core.applet.autosize_window(btn).into()
             }
 
-            // Spotify running: label + optional controls
+            // Spotify running: icon (raises window) + label (opens popup) + optional controls
             PlayerState::Stopped | PlayerState::Active(_) => {
                 let label_text = match &self.player {
                     PlayerState::Active(t) => panel_label_text(t, &self.config),
@@ -494,65 +556,64 @@ impl cosmic::Application for AppModel {
 
                 let is_playing = matches!(&self.player, PlayerState::Active(t) if t.is_playing);
                 let have_popup = self.popup;
-
-                // Main toggle area: icon [+ label]
                 let icon_size = self.core.applet.suggested_size(true).0;
-                let mut label_row = widget::row()
-                    .spacing(4)
-                    .align_y(Alignment::Center)
-                    .push(widget::icon::from_name(panel_icon_name(&self.config)).size(icon_size));
-                if !label_text.is_empty() {
-                    label_row = label_row.push(self.core.applet.text(label_text));
-                }
 
-                let toggle_btn = cosmic::widget::button::custom(label_row)
-                    .padding([v_pad, 6])
-                    .class(cosmic::theme::Button::AppletIcon)
-                    .on_press_with_rectangle(move |_, _| {
-                        if let Some(id) = have_popup {
-                            Message::Surface(destroy_popup(id))
-                        } else {
-                            Message::Surface(app_popup::<AppModel>(
-                                move |state: &mut AppModel| {
-                                    let new_id = Id::unique();
-                                    state.popup = Some(new_id);
-                                    let mut s = state.core.applet.get_popup_settings(
-                                        state.core.main_window_id().unwrap(),
-                                        new_id,
-                                        None,
-                                        None,
-                                        None,
-                                    );
-                                    s.positioner.size_limits = cosmic::iced::Limits::NONE
-                                        .min_width(300.0)
-                                        .max_width(380.0)
-                                        .min_height(80.0)
-                                        .max_height(600.0);
-                                    s
-                                },
-                                Some(Box::new(|state: &AppModel| {
-                                    if state.show_settings {
-                                        build_settings_view(state).map(cosmic::Action::App)
-                                    } else {
-                                        build_main_view(state).map(cosmic::Action::App)
-                                    }
-                                })),
-                            ))
-                        }
-                    });
+                // Icon button — always raises the Spotify window
+                let icon_btn = cosmic::widget::button::custom(
+                    widget::icon::from_name(panel_icon_name(&self.config)).size(icon_size),
+                )
+                .padding([v_pad, 8])
+                .class(cosmic::theme::Button::AppletIcon)
+                .on_press(Message::RaiseSpotify);
 
-                let tooltip = Element::from(self.core.applet.applet_tooltip::<Message>(
-                    toggle_btn,
-                    "Spotify",
-                    self.popup.is_some(),
-                    |a| Message::Surface(a),
-                    None,
-                ));
+                // Label button — toggles the popup (only shown when there is a track)
+                let popup_toggle = move |_, _| {
+                    if let Some(id) = have_popup {
+                        Message::Surface(destroy_popup(id))
+                    } else {
+                        Message::Surface(app_popup::<AppModel>(
+                            move |state: &mut AppModel| {
+                                let new_id = Id::unique();
+                                state.popup = Some(new_id);
+                                let mut s = state.core.applet.get_popup_settings(
+                                    state.core.main_window_id().unwrap(),
+                                    new_id,
+                                    None,
+                                    None,
+                                    None,
+                                );
+                                s.positioner.size_limits = cosmic::iced::Limits::NONE
+                                    .min_width(300.0)
+                                    .max_width(380.0)
+                                    .min_height(80.0)
+                                    .max_height(600.0);
+                                s
+                            },
+                            Some(Box::new(|state: &AppModel| {
+                                if state.show_settings {
+                                    build_settings_view(state).map(cosmic::Action::App)
+                                } else {
+                                    build_main_view(state).map(cosmic::Action::App)
+                                }
+                            })),
+                        ))
+                    }
+                };
 
                 let mut panel_row = widget::row()
                     .spacing(0)
                     .align_y(Alignment::Center)
-                    .push(tooltip);
+                    .push(icon_btn);
+
+                if !label_text.is_empty() {
+                    let label_btn = cosmic::widget::button::custom(
+                        self.core.applet.text(label_text),
+                    )
+                    .padding([v_pad, 4])
+                    .class(cosmic::theme::Button::AppletIcon)
+                    .on_press_with_rectangle(popup_toggle);
+                    panel_row = panel_row.push(label_btn);
+                }
 
                 if self.config.show_prev_panel {
                     panel_row = panel_row.push(
@@ -597,8 +658,29 @@ impl cosmic::Application for AppModel {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        cosmic::iced::time::every(Duration::from_secs(self.config.poll_interval_secs as u64))
-            .map(|_| Message::Tick)
+        let toplevel_sub = Subscription::run_with(1u8, |_| {
+            cosmic::iced_futures::stream::channel(32, move |mut output: cosmic::iced_futures::futures::channel::mpsc::Sender<Message>| async move {
+                let (mpsc_tx, mut mpsc_rx) =
+                    cosmic::iced_futures::futures::channel::mpsc::unbounded::<TopUpdate>();
+                std::thread::spawn(move || {
+                    toplevel::wayland_handler(SPOTIFY_TOPLEVEL_ID.to_string(), mpsc_tx);
+                });
+                use cosmic::iced_futures::futures::StreamExt;
+                use cosmic::iced_futures::futures::SinkExt;
+                while let Some(update) = mpsc_rx.next().await {
+                    let _ = output.send(Message::Toplevel(update)).await;
+                }
+            })
+        });
+
+        Subscription::batch(vec![
+            cosmic::iced::time::every(Duration::from_secs(
+                self.config.poll_interval_secs as u64,
+            ))
+            .map(|_| Message::Tick),
+            activation_token_subscription(0).map(Message::Token),
+            toplevel_sub,
+        ])
     }
 
     fn style(&self) -> Option<cosmic::iced_core::theme::Style> {
@@ -634,7 +716,7 @@ fn build_main_view(state: &AppModel) -> Element<'_, Message> {
                     .push(widget::text("Spotify is not running").size(13))
                     .push(
                         widget::button::standard("Launch Spotify")
-                            .on_press(Message::LaunchSpotify),
+                            .on_press(Message::RaiseSpotify),
                     )
                     .spacing(8)
                     .padding([12, 12]),
@@ -672,11 +754,13 @@ fn build_main_view(state: &AppModel) -> Element<'_, Message> {
                     content = content.add(
                         widget::container(
                             cosmic::iced_widget::image::Image::new(handle)
-                                .width(Length::Fill)
-                                .height(Length::Fixed(280.0))
-                                .content_fit(ContentFit::Cover),
+                                .width(Length::Fixed(220.0))
+                                .height(Length::Fixed(220.0))
+                                .content_fit(ContentFit::Contain),
                         )
-                        .width(Length::Fill),
+                        .width(Length::Fill)
+                        .align_x(cosmic::iced::alignment::Horizontal::Center)
+                        .padding([8, 0]),
                     );
                 } else {
                     // Placeholder while art is loading
@@ -720,7 +804,7 @@ fn build_main_view(state: &AppModel) -> Element<'_, Message> {
                         .align_x(cosmic::iced::alignment::Horizontal::Center),
                     )
                     .spacing(2)
-                    .padding([8, 12, 4, 12]),
+                    .padding([4, 12, 4, 12]),
             );
 
             // Progress: position / duration
